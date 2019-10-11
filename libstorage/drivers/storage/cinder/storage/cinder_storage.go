@@ -24,6 +24,8 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v2/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/gophercloud/gophercloud/openstack/identity/v3/extensions/trusts"
+	"fmt"
+	"path/filepath"
 )
 
 const (
@@ -231,7 +233,7 @@ func (d *driver) Volumes(
 		var volumesRet []*types.Volume
 		for _, volumeOS := range volumesOS {
 			volumesRet = append(volumesRet, translateVolume(
-				&volumeOS, opts.Attachments))
+				ctx, &volumeOS, opts.Attachments))
 		}
 
 		return volumesRet, nil
@@ -251,7 +253,7 @@ func (d *driver) Volumes(
 	var volumesRet []*types.Volume
 	for _, volumeOS := range volumesOS {
 		volumesRet = append(volumesRet, translateVolumeV1(
-			&volumeOS, opts.Attachments))
+			ctx, &volumeOS, opts.Attachments))
 	}
 
 	return volumesRet, nil
@@ -278,7 +280,7 @@ func (d *driver) VolumeInspect(
 				goof.WithFieldsE(fields, "error getting volume", err)
 		}
 
-		return translateVolume(volume, opts.Attachments), nil
+		return translateVolume(ctx, volume, opts.Attachments), nil
 	}
 
 	volume, err := volumesv1.Get(d.clientBlockStorage, volumeID).Extract()
@@ -288,20 +290,75 @@ func (d *driver) VolumeInspect(
 			goof.WithFieldsE(fields, "error getting volume", err)
 	}
 
-	return translateVolumeV1(volume, opts.Attachments), nil
+	return translateVolumeV1(ctx, volume, opts.Attachments), nil
+}
+
+//
+// never trust cinder, even the OpenStack docs say this:
+// * https://docs.openstack.org/nova/latest/user/block-device-mapping.html#intermezzo-problem-with-device-names
+//
+func getRealDeviceNameByID(volumeID string) (string, error) {
+
+	linkedDeviceString := fmt.Sprintf("/dev/disk/by-id/virtio-%s", volumeID[:20])
+
+	realDeviceName, err := filepath.EvalSymlinks(linkedDeviceString)
+	if err == nil {
+		return realDeviceName, nil
+	}
+
+	return "", err
+}
+
+func getRealDeviceName(
+	ctx types.Context,
+	volumeID string,
+	currentInstanceID string,
+	attachmentInstanceID string,
+	attachmentDeviceName string) string {
+
+	fields := eff(goof.Fields{
+		"instanceId": currentInstanceID,
+		"volumeId": volumeID,
+	})
+
+	if currentInstanceID == attachmentInstanceID {
+		if realDeviceName, err := getRealDeviceNameByID(volumeID); err == nil {
+			if attachmentDeviceName != realDeviceName {
+
+				ctx.WithFields(fields).Warn(
+					fmt.Sprintf("replacing '%s' with '%s' due to cinder reporting wrong device name",
+						realDeviceName, attachmentDeviceName))
+
+				return realDeviceName
+			}
+		} else {
+			ctx.WithFields(fields).WithError(err).Warn("Unable to determine real device name")
+		}
+	}
+
+	return attachmentDeviceName
 }
 
 func translateVolumeV1(
+	ctx types.Context,
 	volume *volumesv1.Volume,
 	includeAttachments types.VolumeAttachmentsTypes) *types.Volume {
 
 	var attachments []*types.VolumeAttachment
 	if includeAttachments.Requested() {
+
+		currentInstanceID := context.MustInstanceID(ctx)
+
 		for _, attachment := range volume.Attachments {
+
+			attachmentInstanceID := &types.InstanceID{ID: attachment["server_id"].(string), Driver: cinder.Name}
+			attachmentDeviceName := getRealDeviceName(
+				ctx, volume.ID, currentInstanceID.ID, attachmentInstanceID.ID, attachment["device"].(string))
+
 			libstorageAttachment := &types.VolumeAttachment{
 				VolumeID:   attachment["volume_id"].(string),
-				InstanceID: &types.InstanceID{ID: attachment["server_id"].(string), Driver: cinder.Name},
-				DeviceName: attachment["device"].(string),
+				InstanceID: attachmentInstanceID,
+				DeviceName: attachmentDeviceName,
 				Status:     "",
 			}
 			attachments = append(attachments, libstorageAttachment)
@@ -320,17 +377,27 @@ func translateVolumeV1(
 	}
 }
 
+
 func translateVolume(
+	ctx types.Context,
 	volume *volumes.Volume,
 	includeAttachments types.VolumeAttachmentsTypes) *types.Volume {
 
 	var attachments []*types.VolumeAttachment
 	if includeAttachments.Requested() {
+
+		currentInstanceID := context.MustInstanceID(ctx)
+
 		for _, attachment := range volume.Attachments {
+
+			attachmentInstanceID := &types.InstanceID{ID: attachment.ServerID, Driver: cinder.Name}
+			attachmentDeviceName := getRealDeviceName(
+				ctx, volume.ID, currentInstanceID.ID, attachmentInstanceID.ID, attachment.Device)
+
 			libstorageAttachment := &types.VolumeAttachment{
 				VolumeID:   attachment.VolumeID,
-				InstanceID: &types.InstanceID{ID: attachment.ServerID, Driver: cinder.Name},
-				DeviceName: attachment.Device,
+				InstanceID: attachmentInstanceID,
+				DeviceName: attachmentDeviceName,
 				Status:     "",
 			}
 			attachments = append(attachments, libstorageAttachment)
@@ -561,7 +628,7 @@ func (d *driver) createVolume(
 					"error waiting for volume creation to complete", err)
 		}
 
-		return translateVolume(volume, types.VolumeAttachmentsRequested), nil
+		return translateVolume(ctx, volume, types.VolumeAttachmentsRequested), nil
 	}
 
 	volume, err := volumesv1.Create(d.clientBlockStorage, options).Extract()
@@ -580,7 +647,7 @@ func (d *driver) createVolume(
 				"error waiting for volume creation to complete", err)
 	}
 
-	return translateVolumeV1(volume, types.VolumeAttachmentsRequested), nil
+	return translateVolumeV1(ctx, volume, types.VolumeAttachmentsRequested), nil
 }
 
 func (d *driver) VolumeRemove(
